@@ -1,53 +1,124 @@
-import os
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
+import asyncio
+import logging
+import sqlite3
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message
-from aiogram import F
-from googletrans import Translator
+import aiohttp  # Добавлен импорт aiohttp
 
-API_TOKEN = 'TOKEN'
-translator = Translator()
+from confing import TOKEN, WEATHER_API_KEY
 
-# Инициализация бота и диспетчера
-bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
+# Инициализация логирования
+logging.basicConfig(level=logging.INFO)
 
+# Инициализация бота и диспетчера с хранилищем состояний
+bot = Bot(token=TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+# Определение состояний формы
+class Form(StatesGroup):
+    name = State()
+    age = State()
+    city = State()
+
+# Инициализация базы данных
+def init_db():
+    conn = sqlite3.connect('user_data.db')
+    cur = conn.cursor()
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        age INTEGER NOT NULL,
+        city TEXT NOT NULL
+    )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
 
 # Обработчик команды /start
-@dp.message(Command(commands=['start']))
-async def send_welcome(message: Message):
-    await message.answer("Привет! Я ваш бот.")
+@dp.message(CommandStart())
+async def start(message: Message, state: FSMContext):
+    await message.answer("Привет! Как тебя зовут?")
+    await state.set_state(Form.name)
 
+# Обработчик состояния Form.name
+@dp.message(Form.name)
+async def process_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Сколько тебе лет?")
+    await state.set_state(Form.age)
 
-# Обработчик сообщений с фотографиями
-@dp.message(F.photo)
-async def handle_photo(message: Message):
-    if not os.path.exists('img'):
-        os.makedirs('img')
+# Обработчик состояния Form.age
+@dp.message(Form.age)
+async def process_age(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Пожалуйста, введи корректный возраст (число).")
+        return
+    await state.update_data(age=int(message.text))
+    await message.answer("Из какого ты города?")
+    await state.set_state(Form.city)
 
-    photo = message.photo[-1]
-    file_info = await bot.get_file(photo.file_id)
-    photo_path = f'img/{photo.file_id}.jpg'
-    await bot.download_file(file_info.file_path, photo_path)
-    await message.answer("Я сохранил ваш файл, он в надежных руках!")
+# Обработчик состояния Form.city
+@dp.message(Form.city)
+async def process_city(message: Message, state: FSMContext):
+    await state.update_data(city=message.text)
+    user_data = await state.get_data()
 
+    # Сохранение данных в базу данных
+    try:
+        conn = sqlite3.connect('user_data.db')
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO users (name, age, city) VALUES (?, ?, ?)
+        ''', (user_data['name'], user_data['age'], user_data['city']))
+        conn.commit()
+        conn.close()
 
-# Обработчик текстовых сообщений для перевода на английский
-@dp.message(F.text)
-async def handle_text(message: Message):
-    text_to_translate = message.text
-    translated_text = translator.translate(text_to_translate, src='auto', dest='en').text
-    await message.answer(translated_text)
+        # Получение данных о погоде
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://api.openweathermap.org/data/2.5/weather?q={user_data['city']}&appid={WEATHER_API_KEY}&units=metric&lang=ru") as response:
+                if response.status == 200:
+                    weather_data = await response.json()
+                    main = weather_data['main']
+                    weather = weather_data['weather'][0]
 
+                    temperature = main['temp']
+                    humidity = main['humidity']
+                    description = weather['description']
 
-# Команда для отправки голосового сообщения
-@dp.message(Command(commands=['sendvoice']))
-async def send_voice(message: Message):
-    voice_path = 'path_to_voice_message.ogg'  # Укажите путь к вашему голосовому сообщению
-    with open(voice_path, 'rb') as voice:
-        await message.answer_voice(voice)
+                    weather_report = (f"Город - {user_data['city']}\n"
+                                      f"Температура - {temperature}°C\n"
+                                      f"Влажность воздуха - {humidity}%\n"
+                                      f"Описание погоды - {description}")
 
+                    # Отправка отчета о погоде пользователю
+                    await message.answer(weather_report)
+                else:
+                    await message.answer("Не удалось получить данные о погоде. Попробуйте позже.")
 
-# Запуск бота
-if __name__ == '__main__':
-    dp.run_polling(bot)
+        await message.answer("Спасибо! Твои данные сохранены.")
+    except Exception as e:
+        logging.error(f"Ошибка при сохранении данных: {e}")
+        await message.answer("Произошла ошибка при сохранении данных. Попробуй позже.")
+
+    # Завершение состояния
+    await state.clear()
+
+# Обработчик команды /help
+@dp.message(Command('help'))
+async def help_command(message: Message):
+    await message.answer("Этот бот умеет выполнять команды:\n/start\n/help")
+
+# Основная функция запуска бота
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
